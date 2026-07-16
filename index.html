@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="pt-br">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Pinça → Servo | Teste WebXR + ESP32</title>
+<script src="https://unpkg.com/babylonjs@6.48.1/babylon.js"></script>
+<script src="https://unpkg.com/babylonjs-loaders@6.48.1/babylonjs.loaders.min.js"></script>
+<script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+<style>
+  html, body { margin: 0; padding: 0; overflow: hidden; width: 100%; height: 100%; background: #0a0e14; font-family: 'Segoe UI', system-ui, sans-serif; }
+  #renderCanvas { width: 100%; height: 100%; touch-action: none; display: block; }
+  #hud {
+    position: fixed; top: 12px; left: 12px; z-index: 10;
+    background: rgba(10, 14, 20, 0.75); color: #e6edf3;
+    border: 1px solid #2a3542; border-radius: 10px;
+    padding: 12px 16px; font-size: 13px; line-height: 1.5;
+    max-width: 320px; backdrop-filter: blur(6px);
+  }
+  #hud b { color: #4dd0e1; }
+  #status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #f44336; margin-right: 6px; }
+  #status-dot.on { background: #4caf50; }
+  #config { position: fixed; bottom: 12px; left: 12px; z-index: 10; font-size: 11px; color: #6b7c8f; max-width: 320px; }
+</style>
+</head>
+<body>
+<canvas id="renderCanvas"></canvas>
+
+<div id="hud">
+  <div><span id="status-dot"></span><b>MQTT:</b> <span id="mqtt-status">conectando...</span></div>
+  <div><b>Mão:</b> <span id="hand-status">nenhuma detectada</span></div>
+  <div><b>Ângulo enviado:</b> <span id="angle-value">--</span>°</div>
+  <div style="margin-top:6px; opacity:0.8;">Entre no modo VR (botão inferior), pince o polegar com o indicador e mova a mão pra cima/baixo para variar o ângulo do servo (0°–180°).</div>
+</div>
+<div id="config">
+  Tópico MQTT: <b id="topic-label"></b><br>
+  Broker: broker.hivemq.com (público, só para teste)
+</div>
+
+<script>
+// ======================= CONFIGURAÇÃO =======================
+const MQTT_URL = "wss://broker.hivemq.com:8884/mqtt";
+// Tópico com um sufixo pra evitar colisão com outros usuários do broker público.
+// Troque "luctrevisan" se quiser, mas use o MESMO valor no firmware do ESP32.
+const MQTT_TOPIC = "senai/luctrevisan/pinchservo/angle";
+const PINCH_THRESHOLD = 0.028;      // distância (m) entre polegar e indicador pra considerar "pinçado"
+const PUBLISH_INTERVAL_MS = 120;    // taxa mínima entre publicações MQTT (evita flood)
+// ==============================================================
+
+document.getElementById("topic-label").textContent = MQTT_TOPIC;
+
+// ---------- MQTT ----------
+const statusDot = document.getElementById("status-dot");
+const mqttStatusEl = document.getElementById("mqtt-status");
+const handStatusEl = document.getElementById("hand-status");
+const angleValueEl = document.getElementById("angle-value");
+
+const client = mqtt.connect(MQTT_URL, { reconnectPeriod: 2000 });
+client.on("connect", () => {
+  statusDot.classList.add("on");
+  mqttStatusEl.textContent = "conectado";
+});
+client.on("close", () => {
+  statusDot.classList.remove("on");
+  mqttStatusEl.textContent = "desconectado";
+});
+client.on("error", (err) => {
+  mqttStatusEl.textContent = "erro: " + err.message;
+});
+
+let lastPublish = 0;
+let lastAngleSent = null;
+function publishAngle(angle) {
+  const now = performance.now();
+  const rounded = Math.round(angle);
+  if (rounded === lastAngleSent && now - lastPublish < PUBLISH_INTERVAL_MS) return;
+  if (now - lastPublish < PUBLISH_INTERVAL_MS) return;
+  lastPublish = now;
+  lastAngleSent = rounded;
+  angleValueEl.textContent = rounded;
+  if (client.connected) {
+    client.publish(MQTT_TOPIC, String(rounded));
+  }
+}
+
+// ---------- Babylon.js ----------
+const canvas = document.getElementById("renderCanvas");
+const engine = new BABYLON.Engine(canvas, true, { preserveDrawingBuffer: true, stencil: true });
+
+const createScene = async () => {
+  const scene = new BABYLON.Scene(engine);
+  scene.clearColor = new BABYLON.Color4(0.04, 0.05, 0.08, 1);
+
+  const camera = new BABYLON.ArcRotateCamera("camera", -Math.PI / 2, Math.PI / 2.5, 1.2, new BABYLON.Vector3(0, 1, 0), scene);
+  camera.attachControl(canvas, true);
+  camera.wheelPrecision = 60;
+
+  const light = new BABYLON.HemisphericLight("light", new BABYLON.Vector3(0, 1, 0.3), scene);
+  light.intensity = 0.9;
+
+  const ground = BABYLON.MeshBuilder.CreateGround("ground", { width: 4, height: 4 }, scene);
+  const groundMat = new BABYLON.StandardMaterial("groundMat", scene);
+  groundMat.diffuseColor = new BABYLON.Color3(0.08, 0.09, 0.11);
+  ground.material = groundMat;
+
+  // --- "Servo virtual" de feedback: um braço que gira igual o servo real deveria girar ---
+  const base = BABYLON.MeshBuilder.CreateCylinder("base", { diameter: 0.18, height: 0.05 }, scene);
+  base.position.set(0, 0.85, 0);
+  const baseMat = new BABYLON.StandardMaterial("baseMat", scene);
+  baseMat.diffuseColor = new BABYLON.Color3(0.15, 0.17, 0.2);
+  base.material = baseMat;
+
+  const armPivot = new BABYLON.TransformNode("armPivot", scene);
+  armPivot.position.set(0, 0.88, 0);
+
+  const arm = BABYLON.MeshBuilder.CreateBox("arm", { width: 0.32, height: 0.04, depth: 0.05 }, scene);
+  arm.parent = armPivot;
+  arm.position.x = 0.16;
+  const armMat = new BABYLON.StandardMaterial("armMat", scene);
+  armMat.diffuseColor = new BABYLON.Color3(0.3, 0.8, 0.85);
+  arm.material = armMat;
+
+  function setVirtualServoAngle(angleDeg) {
+    // 0°-180° mapeado para uma rotação visível de -90° a +90° no eixo Y
+    const rad = ((angleDeg - 90) / 90) * (Math.PI / 2);
+    armPivot.rotation.y = rad;
+  }
+  setVirtualServoAngle(90);
+
+  // ---------- WebXR ----------
+  const xrHelper = await scene.createDefaultXRExperienceAsync({
+    floorMeshes: [ground],
+    optionalFeatures: true,
+  });
+
+  let handFeature = null;
+  try {
+    handFeature = xrHelper.baseExperience.featuresManager.enableFeature(
+      BABYLON.WebXRFeatureName.HAND_TRACKING,
+      "latest",
+      { xrInput: xrHelper.input, jointMeshes: { enablePhysics: false } }
+    );
+  } catch (e) {
+    handStatusEl.textContent = "hand-tracking indisponível neste dispositivo/navegador";
+  }
+
+  // Estado de pinça por mão
+  const handState = {
+    left: { pinching: false, startY: 0, startAngle: 90 },
+    right: { pinching: false, startY: 0, startAngle: 90 },
+  };
+  let currentAngle = 90;
+
+  const YRANGE = 0.35; // metros de deslocamento vertical pra ir de 0 a 180 graus
+
+  scene.onBeforeRenderObservable.add(() => {
+    if (!handFeature) return;
+    const hands = handFeature.getHandByHandedness ? null : null;
+
+    ["left", "right"].forEach((handedness) => {
+      const hand = handFeature.getHandByHandedness ? handFeature.getHandByHandedness(handedness) : null;
+      if (!hand) return;
+
+      const thumbTip = hand.getJointMesh ? hand.getJointMesh("thumb-tip") : null;
+      const indexTip = hand.getJointMesh ? hand.getJointMesh("index-finger-tip") : null;
+      if (!thumbTip || !indexTip) return;
+
+      const dist = BABYLON.Vector3.Distance(thumbTip.getAbsolutePosition(), indexTip.getAbsolutePosition());
+      const isPinching = dist < PINCH_THRESHOLD;
+      const state = handState[handedness];
+
+      if (isPinching && !state.pinching) {
+        // início da pinça: calibra referência
+        state.pinching = true;
+        state.startY = indexTip.getAbsolutePosition().y;
+        state.startAngle = currentAngle;
+        handStatusEl.textContent = handedness === "left" ? "esquerda pinçando" : "direita pinçando";
+      } else if (!isPinching && state.pinching) {
+        state.pinching = false;
+        handStatusEl.textContent = "nenhuma detectada";
+      }
+
+      if (state.pinching) {
+        const deltaY = indexTip.getAbsolutePosition().y - state.startY;
+        const deltaAngle = (deltaY / YRANGE) * 180;
+        currentAngle = BABYLON.Scalar.Clamp(state.startAngle + deltaAngle, 0, 180);
+        setVirtualServoAngle(currentAngle);
+        publishAngle(currentAngle);
+      }
+    });
+  });
+
+  return scene;
+};
+
+createScene().then((scene) => {
+  engine.runRenderLoop(() => scene.render());
+});
+
+window.addEventListener("resize", () => engine.resize());
+</script>
+</body>
+</html>
