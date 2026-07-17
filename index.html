@@ -31,6 +31,10 @@
   <div><b>Mão:</b> <span id="hand-status">nenhuma detectada</span></div>
   <div><b>Ângulo enviado:</b> <span id="angle-value">--</span>°</div>
   <div style="margin-top:6px; opacity:0.8;">Entre no modo VR (botão inferior), pince o polegar com o indicador e mova a mão pra cima/baixo para variar o ângulo do servo (0°–180°).</div>
+  <div style="margin-top:10px; padding-top:10px; border-top:1px solid #2a3542;">
+    <label for="angle-slider" style="display:block; margin-bottom:4px; opacity:0.8;">Teste manual (sem headset):</label>
+    <input type="range" id="angle-slider" min="0" max="180" value="90" style="width:100%;">
+  </div>
 </div>
 <div id="config">
   Tópico MQTT: <b id="topic-label"></b><br>
@@ -83,9 +87,26 @@ function publishAngle(angle) {
   }
 }
 
+// ---------- Slider de teste manual (desktop, sem headset) ----------
+// Funciona em paralelo com a pinça em VR: os dois chamam a mesma função
+// setVirtualServoAngle e publicam no mesmo tópico MQTT — não há conflito,
+// o último que mexer é quem manda no ângulo atual.
+const angleSlider = document.getElementById("angle-slider");
+angleSlider.addEventListener("input", (ev) => {
+  const angle = Number(ev.target.value);
+  currentAngle = angle;
+  setVirtualServoAngle(angle);
+  publishAngle(angle);
+});
+
 // ---------- Babylon.js ----------
 const canvas = document.getElementById("renderCanvas");
 const engine = new BABYLON.Engine(canvas, true, { preserveDrawingBuffer: true, stencil: true });
+
+// Função de rotação do servo virtual e ângulo atual — no escopo externo pra
+// serem compartilhados entre a pinça em VR e o slider de teste no desktop.
+let setVirtualServoAngle = () => {};
+let currentAngle = 90;
 
 const createScene = async () => {
   const scene = new BABYLON.Scene(engine);
@@ -103,29 +124,63 @@ const createScene = async () => {
   groundMat.diffuseColor = new BABYLON.Color3(0.08, 0.09, 0.11);
   ground.material = groundMat;
 
-  // --- "Servo virtual" de feedback: um braço que gira igual o servo real deveria girar ---
-  const base = BABYLON.MeshBuilder.CreateCylinder("base", { diameter: 0.18, height: 0.05 }, scene);
-  base.position.set(0, 0.85, 0);
-  const baseMat = new BABYLON.StandardMaterial("baseMat", scene);
-  baseMat.diffuseColor = new BABYLON.Color3(0.15, 0.17, 0.2);
-  base.material = baseMat;
+  // --- Modelo real do servo (Tower Pro MG996) como feedback visual ---
+  // Container que vai receber o corpo do servo, escalado e posicionado na cena.
+  const servoRoot = new BABYLON.TransformNode("servoRoot", scene);
+  servoRoot.position.set(0, 0.85, 0);
 
-  const armPivot = new BABYLON.TransformNode("armPivot", scene);
-  armPivot.position.set(0, 0.88, 0);
+  BABYLON.SceneLoader.ImportMeshAsync("", "./", "tower_pro_mg996.glb", scene).then((result) => {
+    const rootNode = result.meshes[0]; // nó raiz gerado pelo importador (__root__)
 
-  const arm = BABYLON.MeshBuilder.CreateBox("arm", { width: 0.32, height: 0.04, depth: 0.05 }, scene);
-  arm.parent = armPivot;
-  arm.position.x = 0.16;
-  const armMat = new BABYLON.StandardMaterial("armMat", scene);
-  armMat.diffuseColor = new BABYLON.Color3(0.3, 0.8, 0.85);
-  arm.material = armMat;
+    // IMPORTANTE: calcular o bounding box ANTES de reparentar/escalar o modelo,
+    // enquanto ele ainda está em transformação identidade (unidades brutas do glTF).
+    // Calculado depois disso, o resultado viria contaminado pelo deslocamento do servoRoot.
+    const { min, max } = rootNode.getHierarchyBoundingVectors(true);
+    const size = max.subtract(min);
+    const longestSide = Math.max(size.x, size.y, size.z);
+    const targetLength = 0.085; // metros — comprimento real aproximado do MG996
+    const scale = targetLength / longestSide;
 
-  function setVirtualServoAngle(angleDeg) {
-    // 0°-180° mapeado para uma rotação visível de -90° a +90° no eixo Y
-    const rad = ((angleDeg - 90) / 90) * (Math.PI / 2);
-    armPivot.rotation.y = rad;
-  }
-  setVirtualServoAngle(90);
+    rootNode.parent = servoRoot;
+    rootNode.scaling.setAll(scale);
+    // Reposiciona pra apoiar o "chão" do servo em servoRoot (y=0 local)
+    rootNode.position.y = -min.y * scale;
+
+    // Localiza o eixo/spline de latão (material "Brass_-_Matte") pra ser o único elemento
+    // que gira — corpo e aba de fixação do servo ficam parados, como na realidade.
+    let shaftMesh = null;
+    for (const m of result.meshes) {
+      if (m.material && m.material.name && m.material.name.includes("Brass")) {
+        shaftMesh = m;
+        break;
+      }
+    }
+
+    if (shaftMesh) {
+      // Gira em torno do próprio centro geométrico do eixo (pivô local em espaço de objeto),
+      // sem precisar criar um nó separado nem reparentar nada — mais simples e sem risco de
+      // desalinhamento por causa de matrizes de mundo desatualizadas.
+      const localCenter = shaftMesh.getBoundingInfo().boundingBox.center;
+      shaftMesh.setPivotPoint(localCenter, BABYLON.Space.LOCAL);
+
+      setVirtualServoAngle = (angleDeg) => {
+        // 0°-180° mapeado para uma rotação de -90° a +90° no eixo Y (eixo do spline)
+        const rad = ((angleDeg - 90) / 90) * (Math.PI / 2);
+        shaftMesh.rotation.y = rad;
+      };
+    } else {
+      console.warn("Eixo de latão não encontrado no GLB — girando o modelo inteiro como fallback.");
+      setVirtualServoAngle = (angleDeg) => {
+        const rad = ((angleDeg - 90) / 90) * (Math.PI / 2);
+        rootNode.rotation.y = rad;
+      };
+    }
+
+    setVirtualServoAngle(90);
+  }).catch((err) => {
+    console.error("Erro ao carregar tower_pro_mg996.glb:", err);
+    handStatusEl.textContent = "erro ao carregar modelo GLB";
+  });
 
   // ---------- WebXR ----------
   const xrHelper = await scene.createDefaultXRExperienceAsync({
@@ -149,13 +204,11 @@ const createScene = async () => {
     left: { pinching: false, startY: 0, startAngle: 90 },
     right: { pinching: false, startY: 0, startAngle: 90 },
   };
-  let currentAngle = 90;
 
   const YRANGE = 0.35; // metros de deslocamento vertical pra ir de 0 a 180 graus
 
   scene.onBeforeRenderObservable.add(() => {
     if (!handFeature) return;
-    const hands = handFeature.getHandByHandedness ? null : null;
 
     ["left", "right"].forEach((handedness) => {
       const hand = handFeature.getHandByHandedness ? handFeature.getHandByHandedness(handedness) : null;
@@ -184,6 +237,7 @@ const createScene = async () => {
         const deltaY = indexTip.getAbsolutePosition().y - state.startY;
         const deltaAngle = (deltaY / YRANGE) * 180;
         currentAngle = BABYLON.Scalar.Clamp(state.startAngle + deltaAngle, 0, 180);
+        angleSlider.value = Math.round(currentAngle);
         setVirtualServoAngle(currentAngle);
         publishAngle(currentAngle);
       }
